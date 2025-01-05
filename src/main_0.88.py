@@ -1,8 +1,7 @@
 # src/main.py
 import logging
-import numpy as np
 from preprocessing import preprocess_text
-from model import train_model_with_grid_search, add_statistical_features
+from model import train_model_with_grid_search
 from utils import load_data, save_predictions
 from sklearn.model_selection import train_test_split
 
@@ -43,19 +42,13 @@ def main():
     
     # Train model with grid search
     logging.info("Training model...")
-    model, vectorizer, scaler = train_model_with_grid_search(X_train, y_train, X_val, y_val)
+    model, vectorizer = train_model_with_grid_search(X_train, y_train, X_val, y_val)
     
     # Generate predictions
     logging.info("Generating predictions...")
     X_test = test_df['processed_text']
-    X_test_tfidf = vectorizer.transform(X_test)
-    X_test_stats = add_statistical_features(X_test)
-    X_test_combined = np.hstack([
-        X_test_tfidf.toarray(),
-        X_test_stats
-    ])
-    X_test_scaled = scaler.transform(X_test_combined)
-    predictions = model.predict(X_test_scaled)
+    X_test_vectorized = vectorizer.transform(X_test)
+    predictions = model.predict(X_test_vectorized)
     
     # Save predictions
     save_predictions(test_df, predictions)

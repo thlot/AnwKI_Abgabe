@@ -1,103 +1,151 @@
 # src/model.py
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import f1_score, classification_report
-import logging
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 import numpy as np
+import logging
 
 def create_vectorizer():
-    """Create an advanced TF-IDF vectorizer with character n-grams."""
+    """Create an advanced TF-IDF vectorizer with optimized parameters."""
     return TfidfVectorizer(
-        max_features=50000,  # Increased from 10000
-        ngram_range=(1, 3),  # Include bigrams and trigrams
+        max_features=100000,  # Increased features
+        ngram_range=(1, 4),   # Added up to 4-grams
         min_df=2,
-        max_df=0.95,
-        analyzer='char_wb',  # Character n-grams including word boundaries
+        max_df=0.9,          # Adjusted to remove more common words
         strip_accents='unicode',
-        sublinear_tf=True  # Apply sublinear scaling for term frequencies
+        sublinear_tf=True,   # Apply sublinear scaling
+        analyzer='char_wb',   # Use char n-grams with word boundaries
+        binary=False,        # Use frequency information
     )
 
-def create_model():
-    """Create an ensemble of models for better performance."""
-    # SVM with optimized parameters (based on V04 lecture slides)
+def add_statistical_features(X):
+    """Add statistical text features."""
+    features = []
+    for text in X:
+        # Calculate statistical features
+        length = len(text)
+        word_count = len(text.split())
+        avg_word_length = length / max(word_count, 1)
+        unique_chars = len(set(text))
+        
+        # Create feature vector
+        features.append([
+            length,
+            word_count,
+            avg_word_length,
+            unique_chars,
+            text.count('!') / max(length, 1),  # Exclamation mark ratio
+            text.count('?') / max(length, 1),  # Question mark ratio
+            sum(1 for c in text if c.isupper()) / max(length, 1),  # Uppercase ratio
+        ])
+    return np.array(features)
+
+def create_ensemble():
+    """Create an ensemble of different models."""
     svm = LinearSVC(
-        C=1.0,
         class_weight='balanced',
         dual=False,
-        max_iter=2000
+        max_iter=3000,
+        random_state=42
     )
     
-    # Random Forest as complementary model
     rf = RandomForestClassifier(
         n_estimators=200,
-        max_depth=32,
         class_weight='balanced',
+        max_depth=32,
         n_jobs=-1,
         random_state=42
     )
     
-    # Return SVM as primary model (faster and usually better for text)
-    return svm
+    return [('svm', svm), ('rf', rf)]
 
-def train_model(X_train, y_train, X_val=None, y_val=None):
-    """Train model with grid search for optimal parameters."""
-    # Create pipeline
-    pipeline = Pipeline([
-        ('vectorizer', create_vectorizer()),
-        ('classifier', create_model())
+def train_model_with_grid_search(X_train, y_train, X_val=None, y_val=None):
+    """Train model with advanced features and ensemble methods."""
+    # Create and fit vectorizer
+    logging.info("Creating and fitting vectorizer...")
+    vectorizer = create_vectorizer()
+    X_train_tfidf = vectorizer.fit_transform(X_train)
+    
+    # Add statistical features
+    logging.info("Adding statistical features...")
+    X_train_stats = add_statistical_features(X_train)
+    
+    # Combine features
+    X_train_combined = np.hstack([
+        X_train_tfidf.toarray(),
+        X_train_stats
     ])
     
-    # Define parameter grid for grid search
-    param_grid = {
-        'vectorizer__max_features': [30000, 50000],
-        'vectorizer__ngram_range': [(1, 2), (1, 3)],
-        'classifier__C': [0.1, 1.0, 10.0]
-    }
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_combined)
     
-    # Perform grid search with cross-validation
-    grid_search = GridSearchCV(
-        pipeline,
-        param_grid,
-        cv=5,
-        n_jobs=-1,
-        scoring='f1_weighted',
-        verbose=1
-    )
+    # Create models
+    models = create_ensemble()
     
-    # Fit the model
-    logging.info("Starting grid search...")
-    grid_search.fit(X_train, y_train)
+    # Grid search parameters
+    param_grid = [{
+        'C': [0.1, 1.0, 10.0],
+        'tol': [1e-4],
+        'class_weight': ['balanced'],
+        'max_iter': [3000]
+    }]
     
-    # Log best parameters and score
-    logging.info(f"Best parameters: {grid_search.best_params_}")
-    logging.info(f"Best cross-validation score: {grid_search.best_score_:.4f}")
+    # Train each model separately for better control
+    best_f1 = 0
+    best_model = None
+    
+    for name, model in models:
+        logging.info(f"\nTraining {name}...")
+        if isinstance(model, LinearSVC):
+            grid = GridSearchCV(
+                model,
+                param_grid,
+                cv=5,
+                n_jobs=-1,
+                scoring='f1_weighted',
+                verbose=1
+            )
+        else:
+            # Random Forest parameters
+            grid = GridSearchCV(
+                model,
+                {
+                    'n_estimators': [100, 200],
+                    'max_depth': [16, 32],
+                    'class_weight': ['balanced']
+                },
+                cv=5,
+                n_jobs=-1,
+                scoring='f1_weighted',
+                verbose=1
+            )
+        
+        grid.fit(X_train_scaled, y_train)
+        logging.info(f"Best {name} parameters: {grid.best_params_}")
+        logging.info(f"Best {name} cross-validation score: {grid.best_score_:.4f}")
+        
+        if grid.best_score_ > best_f1:
+            best_f1 = grid.best_score_
+            best_model = grid.best_estimator_
     
     # Evaluate on validation set if provided
     if X_val is not None and y_val is not None:
-        val_pred = grid_search.predict(X_val)
+        X_val_tfidf = vectorizer.transform(X_val)
+        X_val_stats = add_statistical_features(X_val)
+        X_val_combined = np.hstack([
+            X_val_tfidf.toarray(),
+            X_val_stats
+        ])
+        X_val_scaled = scaler.transform(X_val_combined)
+        
+        val_pred = best_model.predict(X_val_scaled)
         val_f1 = f1_score(y_val, val_pred, average='weighted')
-        logging.info(f"Validation F1 Score: {val_f1:.4f}")
+        logging.info(f"\nValidation F1 Score: {val_f1:.4f}")
         logging.info("\nClassification Report:\n" + classification_report(y_val, val_pred))
     
-    return grid_search.best_estimator_
-
-def make_prediction(model, X_test):
-    """Make predictions with additional uncertainty handling."""
-    try:
-        predictions = model.predict(X_test)
-        # Add confidence check (if model supports predict_proba)
-        if hasattr(model, 'predict_proba'):
-            probas = model.predict_proba(X_test)
-            # For low confidence predictions, use fallback strategy
-            confidence = np.max(probas, axis=1)
-            low_confidence = confidence < 0.5
-            # Default to 'neither' for very uncertain predictions
-            predictions[low_confidence] = 2
-        return predictions
-    except Exception as e:
-        logging.error(f"Error in prediction: {str(e)}")
-        # Fallback to safe prediction
-        return np.full(X_test.shape[0], 2)  # Default to 'neither'
+    return best_model, vectorizer, scaler
