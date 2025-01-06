@@ -1,151 +1,133 @@
-# src/model.py
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.svm import LinearSVC
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import f1_score, classification_report
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
 import numpy as np
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.linear_model import SGDClassifier
+import re
+from nltk.tokenize import word_tokenize
+import nltk
+from nltk.corpus import stopwords
+import gc
 import logging
 
-def create_vectorizer():
-    """Create an advanced TF-IDF vectorizer with optimized parameters."""
-    return TfidfVectorizer(
-        max_features=100000,  # Increased features
-        ngram_range=(1, 4),   # Added up to 4-grams
-        min_df=2,
-        max_df=0.9,          # Adjusted to remove more common words
-        strip_accents='unicode',
-        sublinear_tf=True,   # Apply sublinear scaling
-        analyzer='char_wb',   # Use char n-grams with word boundaries
-        binary=False,        # Use frequency information
-    )
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def add_statistical_features(X):
-    """Add statistical text features."""
-    features = []
-    for text in X:
-        # Calculate statistical features
-        length = len(text)
-        word_count = len(text.split())
-        avg_word_length = length / max(word_count, 1)
-        unique_chars = len(set(text))
+class MemoryEfficientClassifier:
+    def __init__(self):
+        """Initialize the classifier with memory-efficient components"""
+        # Use HashingVectorizer instead of TfidfVectorizer to save memory
+        self.vectorizer = HashingVectorizer(
+            n_features=2**16,
+            ngram_range=(1, 2),
+            alternate_sign=False
+        )
         
-        # Create feature vector
-        features.append([
-            length,
-            word_count,
-            avg_word_length,
-            unique_chars,
-            text.count('!') / max(length, 1),  # Exclamation mark ratio
-            text.count('?') / max(length, 1),  # Question mark ratio
-            sum(1 for c in text if c.isupper()) / max(length, 1),  # Uppercase ratio
-        ])
-    return np.array(features)
+        # Use SGDClassifier for online learning
+        self.classifier = SGDClassifier(
+            loss='log_loss',
+            max_iter=5,
+            tol=1e-3,
+            n_jobs=1,  # Reduce parallel processing to save memory
+            class_weight='balanced'
+        )
+        
+        # Download NLTK data if needed
+        try:
+            nltk.data.find('tokenizers/punkt')
+            nltk.data.find('corpora/stopwords')
+        except LookupError:
+            nltk.download('punkt', quiet=True)
+            nltk.download('stopwords', quiet=True)
+        
+        self.stop_words = set(stopwords.words('english'))
 
-def create_ensemble():
-    """Create an ensemble of different models."""
-    svm = LinearSVC(
-        class_weight='balanced',
-        dual=False,
-        max_iter=3000,
-        random_state=42
-    )
-    
-    rf = RandomForestClassifier(
-        n_estimators=200,
-        class_weight='balanced',
-        max_depth=32,
-        n_jobs=-1,
-        random_state=42
-    )
-    
-    return [('svm', svm), ('rf', rf)]
+    def preprocess_text(self, text):
+        """Efficiently preprocess a single text string"""
+        try:
+            if not isinstance(text, str):
+                return ''
+            
+            # Lowercase
+            text = text.lower()
+            # Remove special characters
+            text = re.sub(r'[^a-z\s]', '', text)
+            # Tokenize and remove stopwords
+            tokens = word_tokenize(text)
+            tokens = [t for t in tokens if t not in self.stop_words]
+            return ' '.join(tokens)
+        except Exception as e:
+            logger.warning(f"Error preprocessing text: {str(e)}")
+            return ''
 
-def train_model_with_grid_search(X_train, y_train, X_val=None, y_val=None):
-    """Train model with advanced features and ensemble methods."""
-    # Create and fit vectorizer
-    logging.info("Creating and fitting vectorizer...")
-    vectorizer = create_vectorizer()
-    X_train_tfidf = vectorizer.fit_transform(X_train)
-    
-    # Add statistical features
-    logging.info("Adding statistical features...")
-    X_train_stats = add_statistical_features(X_train)
-    
-    # Combine features
-    X_train_combined = np.hstack([
-        X_train_tfidf.toarray(),
-        X_train_stats
-    ])
-    
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_combined)
-    
-    # Create models
-    models = create_ensemble()
-    
-    # Grid search parameters
-    param_grid = [{
-        'C': [0.1, 1.0, 10.0],
-        'tol': [1e-4],
-        'class_weight': ['balanced'],
-        'max_iter': [3000]
-    }]
-    
-    # Train each model separately for better control
-    best_f1 = 0
-    best_model = None
-    
-    for name, model in models:
-        logging.info(f"\nTraining {name}...")
-        if isinstance(model, LinearSVC):
-            grid = GridSearchCV(
-                model,
-                param_grid,
-                cv=5,
-                n_jobs=-1,
-                scoring='f1_weighted',
-                verbose=1
-            )
-        else:
-            # Random Forest parameters
-            grid = GridSearchCV(
-                model,
-                {
-                    'n_estimators': [100, 200],
-                    'max_depth': [16, 32],
-                    'class_weight': ['balanced']
-                },
-                cv=5,
-                n_jobs=-1,
-                scoring='f1_weighted',
-                verbose=1
-            )
-        
-        grid.fit(X_train_scaled, y_train)
-        logging.info(f"Best {name} parameters: {grid.best_params_}")
-        logging.info(f"Best {name} cross-validation score: {grid.best_score_:.4f}")
-        
-        if grid.best_score_ > best_f1:
-            best_f1 = grid.best_score_
-            best_model = grid.best_estimator_
-    
-    # Evaluate on validation set if provided
-    if X_val is not None and y_val is not None:
-        X_val_tfidf = vectorizer.transform(X_val)
-        X_val_stats = add_statistical_features(X_val)
-        X_val_combined = np.hstack([
-            X_val_tfidf.toarray(),
-            X_val_stats
-        ])
-        X_val_scaled = scaler.transform(X_val_combined)
-        
-        val_pred = best_model.predict(X_val_scaled)
-        val_f1 = f1_score(y_val, val_pred, average='weighted')
-        logging.info(f"\nValidation F1 Score: {val_f1:.4f}")
-        logging.info("\nClassification Report:\n" + classification_report(y_val, val_pred))
-    
-    return best_model, vectorizer, scaler
+    def data_generator(self, file_path, chunk_size=100):
+        """Generator to load and preprocess data in small chunks"""
+        try:
+            for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+                # Preprocess texts
+                chunk['text'] = chunk['text'].apply(self.preprocess_text)
+                
+                # Convert to features
+                X = self.vectorizer.transform(chunk['text'])
+                
+                if 'label' in chunk.columns:
+                    y = chunk['label'].values
+                    yield X, y
+                else:
+                    yield X
+                
+                # Force garbage collection
+                del chunk
+                gc.collect()
+                
+        except Exception as e:
+            logger.error(f"Error in data generator: {str(e)}")
+            raise
+
+    def train(self, train_file):
+        """Train the model using small batches"""
+        logger.info("Starting training...")
+        try:
+            # Process data in small chunks
+            for i, (X, y) in enumerate(self.data_generator(train_file)):
+                self.classifier.partial_fit(X, y, classes=np.array([0, 1, 2]))
+                
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {(i + 1) * 100} samples")
+                
+        except Exception as e:
+            logger.error(f"Error during training: {str(e)}")
+            raise
+
+    def predict_and_save(self, test_file, output_file, chunk_size=100):
+        """Generate and save predictions in chunks"""
+        logger.info("Starting prediction...")
+        try:
+            # Read the original test file in chunks and keep only necessary columns
+            reader = pd.read_csv(test_file, chunksize=chunk_size)
+            first_chunk = True
+            
+            for i, chunk in enumerate(reader):
+                # Get predictions for this chunk
+                X = next(self.data_generator(test_file, chunk_size=len(chunk)))
+                predictions = self.classifier.predict(X)
+                
+                # Add predictions to chunk
+                chunk['label'] = predictions
+                
+                # Save chunk
+                mode = 'w' if first_chunk else 'a'
+                header = first_chunk
+                chunk.to_csv(output_file, mode=mode, header=header, index=False)
+                
+                first_chunk = False
+                
+                if (i + 1) % 10 == 0:
+                    logger.info(f"Processed {(i + 1) * chunk_size} predictions")
+                
+                # Clean up
+                del chunk, X, predictions
+                gc.collect()
+                
+        except Exception as e:
+            logger.error(f"Error during prediction: {str(e)}")
+            raise
